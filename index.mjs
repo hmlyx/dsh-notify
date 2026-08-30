@@ -8,6 +8,29 @@
  *  - 队列：AI/插件推送 → host 内存队列 → client 轮询拉取
  *
  * 生命周期与进程一致：装上即永久生效，重启不消失，无需审批。
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 接口与功能目录（写给其他 AI：改这里前先看本目录，改完同步更新）
+ * ══════════════════════════════════════════════════════════════
+ * ── HTTP 接口（webServer.register，全部 /__notify/*）──
+ *   POST /__notify/push        {text,link?,source?}     推送提醒入队，返回 {ok,id}
+ *   GET  /__notify/poll                                  取走队列（client 每 1.2s 轮询）
+ *   POST /__notify/set-ai-summary {sessionId,enabled}    AI 总结开关（影响 systemPrompt）
+ *   GET  /__notify/asset?name=                           插件内置素材（assets/，防目录穿越）
+ *   GET  /__notify/file?path=                            自定义本地图片（读任意路径，校验扩展名）
+ *   GET  /__notify/user-image?name=                      用户导入素材（.dsh-notify-data/images/）
+ *   POST /__notify/import-image {dataUrl,category}       导入素材并持久化（sha256 去重）
+ *   GET  /__notify/history                               历史素材列表 {bubbleBg,bubbleBorder,windowBg,windowBorder}
+ *   POST /__notify/history/delete {name,category}        删除历史素材（连带删文件）
+ *   POST /__notify/restart-app                           重启桌面窗口（detached helper：杀窗口→等端口→重开）
+ * ── 注册的对外能力 ──
+ *   工具 notify_push（任何预设/AI 可用，systemPrompt 有使用指引）
+ *   systemPrompt 注入「AI 总结」指引（aiSummaryBySession 按会话开关）
+ * ── 数据位置 ──
+ *   DATA_DIR = ~/.dsh/profiles/web/.dsh-notify-data/（images/ 存素材，history.json 存历史）
+ *   ASSETS_DIR = 插件包内 assets/（内置预设素材）
+ * ── 常量/配置 ──
+ *   MAX_BODY_BYTES=4MB（图片导入上限）、IMAGE_EXT 允许扩展名、category 四分类
  */
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
