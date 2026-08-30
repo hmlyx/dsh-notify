@@ -7,6 +7,31 @@
  *
  * 注意：静态 client bundle 没有动态插件的 `styles` Builtin——
  * 样式用 document.createElement('style') 手动注入（apply 内）。
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 接口与功能目录（写给其他 AI：改这里前先看本目录，改完同步更新）
+ * ══════════════════════════════════════════════════════════════
+ * ── UI 功能区域 ──
+ * 1. 🔔 提醒入口按钮（conversation.input.right 槽位）
+ *    → BubbleEntry 组件：显示未读徽标，点击打开面板
+ * 2. 🔄 快速重启按钮（conversation.input.left 槽位）
+ *    → RestartButton 组件：调 /dsh-market/restart（重启服务器）+ /__notify/restart-app（重启桌面窗口）
+ * 3. 提醒面板（conversation.input.overlay 槽位）→ BubblePanel 组件
+ *    用 ReactDOM.createPortal 渲染到 document.body（脱离 composer 子树，避免撑高滚动区）
+ *    - 消息列表：data-notify-bubble-list，聊天式堆叠（最新在底部），双击展开，滚动条悬停显示
+ *    - 底部按钮：提醒开关 / 重置大小 / AI总结 / 外观 / 收起
+ *    - 仅「对话」标签显示：输入卡不可见时面板隐藏（composerVisible 检测，兼容其他插件标签）
+ * 4. 外观面板 → AppearancePicker 组件（覆盖面板内容）：
+ *    预设 / 泡泡背景边框(拉伸 fill/contain) / 窗口背景边框 / 透明度滑块 / 文字颜色+色号输入 /
+ *    实时预览 / 历史素材（折叠+展开按钮+删除） / 完成
+ * ── host 接口（见 index.mjs 头部同名目录）──
+ *    POST /__notify/push · GET /__notify/poll · POST /__notify/set-ai-summary
+ *    GET /__notify/asset · GET /__notify/file · GET /__notify/user-image
+ *    POST /__notify/import-image · GET /__notify/history · POST /__notify/history/delete
+ *    POST /__notify/restart-app
+ * ── 数据位置 ──
+ *    用户素材：~/.dsh/profiles/web/.dsh-notify-data/{images/,history.json}
+ *    外观设置：localStorage['dsh-notify-appearance']
  */
 window.__ModuleLoader__.load({
   id: 'dsh-notify',
@@ -25,7 +50,9 @@ window.__ModuleLoader__.load({
     const CSS = `
 [data-notify-bubble-panel] {
   position: fixed;
-  z-index: 5;
+  /* Portal 到 body 后要盖过应用的对话层（overlayLayer z=20 / composerSeat z=7 / 边栏把手 z=8），
+     同时保持低于弹窗(z=1000)与 wallpaper-engine 的 UI(z≈995) */
+  z-index: 50;
   background: transparent;
   color: var(--dsw-alias-label-primary, #111);
   display: flex;
@@ -496,6 +523,8 @@ window.__ModuleLoader__.load({
         const [appearanceOpen, setAppearanceOpen] = React.useState(store.appearanceOpen)
         const [pos, setPos] = React.useState(null)
         const [userSize, setUserSize] = React.useState(null)
+        // 非对话标签（轨迹/记忆/其他插件全屏视图）下隐藏面板
+        const [hidden, setHidden] = React.useState(false)
         const dragRef = React.useRef(null)
         const listRef = React.useRef(null)
 
@@ -523,11 +552,15 @@ window.__ModuleLoader__.load({
             const card = document.querySelector('[data-composer-card]')
             const vw = window.innerWidth
             const vh = window.innerHeight
+            // 只在「对话」标签下显示：输入卡可见=对话视图激活；其他标签（轨迹/记忆/其他插件
+            // 的全屏视图）输入卡被隐藏，此时隐藏面板，避免面板测量出错跑到屏幕左边。
+            const composerVisible = !!card && card.getBoundingClientRect().height > 0
+            setHidden(!composerVisible)
             // 面板以 Portal 挂在 body 下（position:fixed 相对视口），bottom 固定离底 8px
             const bottom = 8
             let left = 0
             let autoWidth = 300
-            if (card) {
+            if (card && composerVisible) {
               const cr = card.getBoundingClientRect()
               // 与输入卡右侧的可拖拽边栏保持 10px 间隙，再整体右移 34px 避免重叠
               const gap = 44
@@ -640,7 +673,7 @@ window.__ModuleLoader__.load({
           window.addEventListener('mouseup', onUp)
         }
 
-        if (!open || !pos) return null
+        if (!open || !pos || hidden) return null
         const style = {
           left: pos.left,
           bottom: pos.bottom,
