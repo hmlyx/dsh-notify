@@ -424,6 +424,22 @@ window.__ModuleLoader__.load({
       }
       const notify = () => { for (const l of store.listeners) { try { l() } catch { /* 忽略 */ } } }
       const subscribe = (fn) => { store.listeners.add(fn); return () => store.listeners.delete(fn) }
+
+      // 随机装扮池：从用户导入的自定义预设里随机（pool={enabled, presetNames}，空=全部预设）
+      let customPresetsData = [] // 全部自定义预设（host /__notify/presets）
+      let randomPool = { enabled: false, presetNames: [] }
+      const loadRandomConfig = () => {
+        fetch('/__notify/presets', { cache: 'no-store' })
+          .then((r) => r.json())
+          .then((res) => { if (res && res.ok) customPresetsData = res.presets || [] })
+          .catch(() => {})
+        fetch('/__notify/random-pool', { cache: 'no-store' })
+          .then((r) => r.json())
+          .then((res) => { if (res && res.ok) randomPool = res.pool || randomPool })
+          .catch(() => {})
+      }
+      loadRandomConfig()
+
       const push = (entry) => {
         if (!store.enabled) return
         const item = {
@@ -432,6 +448,25 @@ window.__ModuleLoader__.load({
           link: entry && entry.link ? String(entry.link) : '',
           source: entry && entry.source ? String(entry.source) : '',
           ts: (entry && entry.ts) || Date.now(),
+        }
+        // 随机装扮：从启用的自定义预设里随机抽一个，把整套泡泡外观（背景/透明度/模糊/文字/页边距）绑到这条泡泡上
+        if (randomPool.enabled) {
+          const candidates = customPresetsData.filter(
+            (p) => randomPool.presetNames.length === 0 || randomPool.presetNames.includes(p.name))
+          if (candidates.length > 0) {
+            const pick = candidates[Math.floor(Math.random() * candidates.length)]
+            if (pick && pick.bubbleBg && pick.bubbleBg.path) {
+              item.outfit = {
+                bubbleBg: { path: pick.bubbleBg.path, stretch: pick.bubbleBg.stretch !== false },
+                bubbleBgOpacity: pick.bubbleBgOpacity != null ? pick.bubbleBgOpacity : 1,
+                bubbleBgBlur: pick.bubbleBgBlur || 0,
+                textColor: pick.textColor || '#111111',
+                paddingV: pick.paddingV != null ? pick.paddingV : 10,
+                paddingH: pick.paddingH != null ? pick.paddingH : 10,
+                truncate: !!pick.truncate,
+              }
+            }
+          }
         }
         // column-reverse 把数组头显示在底部：新消息插到数组开头 → 显示在面板底部
         store.items = [item, ...store.items]
@@ -451,26 +486,36 @@ window.__ModuleLoader__.load({
       const APPEARANCE_KEY = 'dsh-notify-appearance'
       const DEFAULT_APPEARANCE = {
         preset: 'bubble1',
-        // 泡泡：背景/边框图片 + 是否拉伸
+        // 泡泡：只有背景图（抛弃边框），+ 拉伸 + 透明度 + 模糊
         bubbleBg: { path: '/__notify/assets/泡泡背景1.png', stretch: true },
-        bubbleBorder: { path: '/__notify/assets/泡泡边框.png', stretch: true },
         bubbleBgOpacity: 1,
-        bubbleBorderOpacity: 1,
-        // 窗口：背景/边框图片 + 是否拉伸
+        bubbleBgBlur: 0,
+        // 窗口：背景/边框（边框暂不改）+ 拉伸 + 透明度 + 背景模糊
         windowBg: { path: '/__notify/assets/窗口背景.png', stretch: true },
         windowBorder: { path: '/__notify/assets/窗口边框.png', stretch: true },
         windowBgOpacity: 1,
         windowBorderOpacity: 1,
-        // 文字
-        padding: 10,
+        windowBgBlur: 0,
+        // 文字：颜色 + 上下/左右页边距 + 省略开关
         textColor: '#111111',
+        paddingV: 10,
+        paddingH: 10,
+        truncate: false,
       }
       const loadAppearance = () => {
         try {
           const raw = localStorage.getItem(APPEARANCE_KEY)
           if (raw) {
             const parsed = JSON.parse(raw)
-            return { ...DEFAULT_APPEARANCE, ...parsed }
+            const merged = { ...DEFAULT_APPEARANCE, ...parsed }
+            // 兼容旧数据：单一 padding → 上下/左右；缺失新字段补默认
+            if (merged.paddingV == null && parsed.padding != null) merged.paddingV = parsed.padding
+            if (merged.paddingH == null && parsed.padding != null) merged.paddingH = parsed.padding
+            if (merged.bubbleBgBlur == null) merged.bubbleBgBlur = 0
+            if (merged.windowBgBlur == null) merged.windowBgBlur = 0
+            if (merged.truncate == null) merged.truncate = false
+            delete merged.padding
+            return merged
           }
         } catch { /* 回退默认 */ }
         return { ...DEFAULT_APPEARANCE }
@@ -690,8 +735,9 @@ window.__ModuleLoader__.load({
               'data-notify-window-bg': '',
               src: imgUrl(appearance.windowBg.path),
               style: {
-                opacity: appearance.windowBgOpacity || 1,
+                opacity: appearance.windowBgOpacity ?? 1,
                 objectFit: appearance.windowBg.stretch ? 'fill' : 'contain',
+                filter: appearance.windowBgBlur ? 'blur(' + appearance.windowBgBlur + 'px)' : undefined,
               },
               draggable: false,
             })
@@ -702,7 +748,7 @@ window.__ModuleLoader__.load({
               'data-notify-window-border': '',
               src: imgUrl(appearance.windowBorder.path),
               style: {
-                opacity: appearance.windowBorderOpacity || 1,
+                opacity: appearance.windowBorderOpacity ?? 1,
                 objectFit: appearance.windowBorder.stretch ? 'fill' : 'contain',
               },
               draggable: false,
@@ -742,41 +788,46 @@ window.__ModuleLoader__.load({
             const sourceEl = item.source
               ? React.createElement('span', { key: 's', 'data-notify-bubble-source': '' }, '来自：' + item.source)
               : null
-            // 泡泡分层：背景（下层）、文字（中间）、边框（上层）
-            const bubbleBg = appearance.bubbleBg && appearance.bubbleBg.path
+            // 泡泡外观：优先用这条泡泡的随机装扮（item.outfit 全套），否则用全局外观；已抛弃边框
+            const o = item && item.outfit
+            const bgPath = (o && o.bubbleBg && o.bubbleBg.path) || (appearance.bubbleBg && appearance.bubbleBg.path)
+            const bubbleBg = bgPath
               ? React.createElement('img', {
                   key: 'bbg',
                   'data-notify-bubble-bg': '',
-                  src: imgUrl(appearance.bubbleBg.path),
+                  src: imgUrl(bgPath),
                   style: {
-                    opacity: appearance.bubbleBgOpacity || 1,
-                    objectFit: appearance.bubbleBg.stretch ? 'fill' : 'contain',
+                    opacity: o ? (o.bubbleBgOpacity != null ? o.bubbleBgOpacity : 1) : (appearance.bubbleBgOpacity ?? 1),
+                    objectFit: (o ? o.bubbleBg.stretch : appearance.bubbleBg.stretch) ? 'fill' : 'contain',
+                    filter: (o ? (o.bubbleBgBlur || 0) : (appearance.bubbleBgBlur || 0)) ? 'blur(' + ((o ? o.bubbleBgBlur : appearance.bubbleBgBlur) || 0) + 'px)' : undefined,
                   },
                   draggable: false,
                 })
               : null
-            const bubbleBorder = appearance.bubbleBorder && appearance.bubbleBorder.path
-              ? React.createElement('img', {
-                  key: 'bbrd',
-                  'data-notify-bubble-border': '',
-                  src: imgUrl(appearance.bubbleBorder.path),
-                  style: {
-                    opacity: appearance.bubbleBorderOpacity || 1,
-                    objectFit: appearance.bubbleBorder.stretch ? 'fill' : 'contain',
-                  },
-                  draggable: false,
-                })
-              : null
+            const pv = (o ? o.paddingV : appearance.paddingV) || 0
+            const ph = (o ? o.paddingH : appearance.paddingH) || 0
+            const textColor = o ? (o.textColor || '#111111') : appearance.textColor
+            const truncate = o ? !!o.truncate : !!appearance.truncate
+            const textStyle = {
+              color: textColor,
+              padding: pv + 'px ' + ph + 'px',
+            }
+            // 省略开关：开启时文字超过 6 行截断为 "..."（不出现滚动条）
+            if (truncate) {
+              textStyle.display = '-webkit-box'
+              textStyle.WebkitBoxOrient = 'vertical'
+              textStyle.WebkitLineClamp = 6
+              textStyle.overflow = 'hidden'
+            }
             return React.createElement('div', {
               key: item.id,
               'data-notify-bubble-item': '',
               onDoubleClick: () => setExpanded((v) => !v),
               title: '双击展开/收起',
-              style: { padding: appearance.padding },
+              style: { padding: pv + 'px ' + ph + 'px' },
             }, [
               bubbleBg,
-              bubbleBorder,
-              React.createElement('div', { key: 'text', 'data-notify-bubble-text': '', style: { color: appearance.textColor, padding: appearance.padding } }, [
+              React.createElement('div', { key: 'text', 'data-notify-bubble-text': '', style: textStyle }, [
                 sourceEl,
                 item.text,
                 linkEl,
@@ -898,15 +949,17 @@ window.__ModuleLoader__.load({
             appearance: {
               preset: 'bubble1',
               bubbleBg: { path: '/__notify/assets/泡泡背景1.png', stretch: true },
-              bubbleBorder: { path: '/__notify/assets/泡泡边框.png', stretch: true },
               bubbleBgOpacity: 1,
-              bubbleBorderOpacity: 1,
+              bubbleBgBlur: 0,
               windowBg: { path: '/__notify/assets/窗口背景.png', stretch: true },
               windowBorder: { path: '/__notify/assets/窗口边框.png', stretch: true },
               windowBgOpacity: 1,
               windowBorderOpacity: 1,
-              padding: 10,
+              windowBgBlur: 0,
               textColor: '#111111',
+              paddingV: 10,
+              paddingH: 10,
+              truncate: false,
             },
           },
           {
@@ -915,15 +968,17 @@ window.__ModuleLoader__.load({
             appearance: {
               preset: 'default',
               bubbleBg: { path: '', stretch: true },
-              bubbleBorder: { path: '', stretch: true },
               bubbleBgOpacity: 1,
-              bubbleBorderOpacity: 1,
+              bubbleBgBlur: 0,
               windowBg: { path: '', stretch: true },
               windowBorder: { path: '', stretch: true },
               windowBgOpacity: 1,
               windowBorderOpacity: 1,
-              padding: 10,
+              windowBgBlur: 0,
               textColor: '#111111',
+              paddingV: 10,
+              paddingH: 10,
+              truncate: false,
             },
           },
         ]
@@ -933,15 +988,17 @@ window.__ModuleLoader__.load({
           const a = preset.appearance
           appearance.preset = a.preset
           appearance.bubbleBg = { ...a.bubbleBg }
-          appearance.bubbleBorder = { ...a.bubbleBorder }
           appearance.windowBg = { ...a.windowBg }
           appearance.windowBorder = { ...a.windowBorder }
-          appearance.bubbleBgOpacity = a.bubbleBgOpacity
-          appearance.bubbleBorderOpacity = a.bubbleBorderOpacity
-          appearance.windowBgOpacity = a.windowBgOpacity
-          appearance.windowBorderOpacity = a.windowBorderOpacity
-          appearance.padding = a.padding
-          appearance.textColor = a.textColor
+          appearance.bubbleBgOpacity = a.bubbleBgOpacity != null ? a.bubbleBgOpacity : 1
+          appearance.bubbleBgBlur = a.bubbleBgBlur != null ? a.bubbleBgBlur : 0
+          appearance.windowBgOpacity = a.windowBgOpacity != null ? a.windowBgOpacity : 1
+          appearance.windowBorderOpacity = a.windowBorderOpacity != null ? a.windowBorderOpacity : 1
+          appearance.windowBgBlur = a.windowBgBlur != null ? a.windowBgBlur : 0
+          appearance.paddingV = a.paddingV != null ? a.paddingV : (a.padding != null ? a.padding : 10)
+          appearance.paddingH = a.paddingH != null ? a.paddingH : (a.padding != null ? a.padding : 10)
+          appearance.textColor = a.textColor || '#111111'
+          appearance.truncate = !!a.truncate
           saveAppearance()
           refresh()
         }
@@ -1005,9 +1062,110 @@ window.__ModuleLoader__.load({
         }
         const HISTORY_LABELS = {
           bubbleBg: '泡泡背景历史',
-          bubbleBorder: '泡泡边框历史',
           windowBg: '窗口背景历史',
           windowBorder: '窗口边框历史',
+        }
+
+        // ---------- 自定义预设（存磁盘、可改名、泡泡外观全套） ----------
+        const [customPresets, setCustomPresets] = React.useState([])
+        const [presetNameDraft, setPresetNameDraft] = React.useState('')
+        const [renaming, setRenaming] = React.useState(null) // 正在改名的预设名
+        const [renameDraft, setRenameDraft] = React.useState('')
+        const [presetsExpanded, setPresetsExpanded] = React.useState(false) // 预设列表展开/折叠
+        const loadPresets = () => {
+          fetch('/__notify/presets', { cache: 'no-store' })
+            .then((r) => r.json())
+            .then((res) => {
+              if (res && res.ok) {
+                setCustomPresets(res.presets || [])
+                customPresetsData = res.presets || [] // 同步给随机装扮池
+              }
+            })
+            .catch(() => {})
+        }
+        React.useEffect(() => { loadPresets() }, [])
+        const applyCustomPreset = (preset) => {
+          const a = preset || {}
+          appearance.preset = 'custom'
+          if (a.bubbleBg) appearance.bubbleBg = { path: a.bubbleBg.path || '', stretch: a.bubbleBg.stretch !== false }
+          appearance.bubbleBgOpacity = a.bubbleBgOpacity != null ? a.bubbleBgOpacity : 1
+          appearance.bubbleBgBlur = a.bubbleBgBlur || 0
+          appearance.textColor = a.textColor || '#111111'
+          appearance.paddingV = a.paddingV != null ? a.paddingV : 10
+          appearance.paddingH = a.paddingH != null ? a.paddingH : 10
+          appearance.truncate = !!a.truncate
+          saveAppearance()
+          refresh()
+        }
+        const saveCurrentAsPreset = () => {
+          const name = presetNameDraft.trim()
+          if (!name) return
+          const preset = {
+            bubbleBg: { path: appearance.bubbleBg.path || '', stretch: !!appearance.bubbleBg.stretch },
+            bubbleBgOpacity: appearance.bubbleBgOpacity,
+            bubbleBgBlur: appearance.bubbleBgBlur || 0,
+            textColor: appearance.textColor,
+            paddingV: appearance.paddingV,
+            paddingH: appearance.paddingH,
+            truncate: !!appearance.truncate,
+          }
+          fetch('/__notify/presets/save', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name, preset }),
+          }).then((r) => r.json()).then((res) => {
+            if (res && res.ok) { setPresetNameDraft(''); loadPresets() }
+          }).catch(() => {})
+        }
+        const renamePreset = (oldName) => {
+          const newName = renameDraft.trim()
+          if (!newName || !oldName) { setRenaming(null); return }
+          fetch('/__notify/presets/rename', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ oldName, newName }),
+          }).then((r) => r.json()).then((res) => {
+            if (res && res.ok) { setRenaming(null); loadPresets() }
+          }).catch(() => {})
+        }
+        const deletePreset = (name) => {
+          fetch('/__notify/presets/delete', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name }),
+          }).then((r) => r.json()).then((res) => { if (res && res.ok) loadPresets() }).catch(() => {})
+        }
+
+        // ---------- 随机泡泡装扮（从用户导入的自定义预设里随机） ----------
+        const [poolEnabled, setPoolEnabled] = React.useState(randomPool.enabled)
+        const [poolSelected, setPoolSelected] = React.useState([])
+        const [poolScanMsg, setPoolScanMsg] = React.useState('')
+        const [poolExpanded, setPoolExpanded] = React.useState(false) // 随机来源勾选列表展开/折叠
+        // 池没指定预设（空=全部）时，默认全选所有自定义预设
+        React.useEffect(() => {
+          if (customPresets.length === 0) return
+          if (randomPool.presetNames && randomPool.presetNames.length > 0) {
+            setPoolSelected(randomPool.presetNames)
+          } else {
+            setPoolSelected(customPresets.map((p) => p.name))
+          }
+        }, [customPresets.length])
+        const togglePoolOutfit = (name) => {
+          setPoolSelected((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name])
+        }
+        const saveRandomPool = () => {
+          const pool = {
+            enabled: poolEnabled,
+            presetNames: poolSelected.length === customPresets.length ? [] : poolSelected,
+          }
+          randomPool = pool
+          fetch('/__notify/random-pool/save', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ pool }),
+          }).then((r) => r.json()).then((res) => {
+            if (res && res.ok) setPoolScanMsg('已保存：' + (pool.enabled ? '随机装扮已开启（' + (pool.presetNames.length === 0 ? '全部预设' : pool.presetNames.length + ' 个预设') + '）' : '随机装扮已关闭'))
+          }).catch(() => {})
         }
         const userImageUrl = (name) => '/__notify/user-image?name=' + encodeURIComponent(name)
         // 历史默认折叠：最多展示 3 张（最新的在前），更多时显示「+N 张」按钮，点击展开全部
@@ -1058,17 +1216,18 @@ window.__ModuleLoader__.load({
         }
 
         // ---------- 实时预览（窗口与历史素材之间） ----------
-        // 用当前外观设置渲染一个示例泡泡：窗口背景/边框做底色，泡泡背景/边框/文字分层
-        const fitStyle = (slot, opacityKey) => ({
-          opacity: appearance[opacityKey] || 1,
+        // 用当前外观设置渲染一个示例泡泡：窗口背景/边框做底色，泡泡背景/文字分层（已抛弃边框）
+        const fitStyle = (slot, opacityKey, blurKey) => ({
+          opacity: appearance[opacityKey] ?? 1,
           objectFit: slot.stretch ? 'fill' : 'contain',
+          filter: blurKey && appearance[blurKey] ? 'blur(' + appearance[blurKey] + 'px)' : undefined,
         })
         const renderPreview = () => {
           const pvWindowBg = appearance.windowBg && appearance.windowBg.path
             ? React.createElement('img', {
                 key: 'wbg', 'data-notify-preview-window-bg': '',
                 src: imgUrl(appearance.windowBg.path),
-                style: fitStyle(appearance.windowBg, 'windowBgOpacity'),
+                style: fitStyle(appearance.windowBg, 'windowBgOpacity', 'windowBgBlur'),
                 draggable: false,
               })
             : null
@@ -1084,34 +1243,26 @@ window.__ModuleLoader__.load({
             ? React.createElement('img', {
                 key: 'bbg', 'data-notify-preview-bg': '',
                 src: imgUrl(appearance.bubbleBg.path),
-                style: fitStyle(appearance.bubbleBg, 'bubbleBgOpacity'),
+                style: fitStyle(appearance.bubbleBg, 'bubbleBgOpacity', 'bubbleBgBlur'),
                 draggable: false,
               })
             : null
-          const pvBubbleBorder = appearance.bubbleBorder && appearance.bubbleBorder.path
-            ? React.createElement('img', {
-                key: 'bbd', 'data-notify-preview-border': '',
-                src: imgUrl(appearance.bubbleBorder.path),
-                style: fitStyle(appearance.bubbleBorder, 'bubbleBorderOpacity'),
-                draggable: false,
-              })
-            : null
+          const pvPad = (appearance.paddingV || 0) + 'px ' + (appearance.paddingH || 0) + 'px'
           return React.createElement('div', { key: 'pv', 'data-notify-appearance-preview': '' }, [
-            React.createElement('div', { key: 'cap', 'data-notify-preview-caption': '' }, '👀 实时预览：改素材/透明度/文字立即生效'),
+            React.createElement('div', { key: 'cap', 'data-notify-preview-caption': '' }, '👀 实时预览：改素材/透明度/模糊/文字立即生效'),
             React.createElement('div', { key: 'win', 'data-notify-preview-window': '' }, [
               pvWindowBg,
               pvWindowBorder,
               React.createElement('div', {
                 key: 'bub',
                 'data-notify-preview-bubble': '',
-                style: { padding: appearance.padding },
+                style: { padding: pvPad },
               }, [
                 pvBubbleBg,
-                pvBubbleBorder,
                 React.createElement('div', {
                   key: 'txt',
                   'data-notify-preview-text': '',
-                  style: { color: appearance.textColor, padding: appearance.padding },
+                  style: { color: appearance.textColor, padding: pvPad },
                 }, '示例提醒：这是一条预览消息 🔔'),
               ]),
             ]),
@@ -1199,10 +1350,9 @@ window.__ModuleLoader__.load({
             }, p.name)),
           ]),
           React.createElement('div', { key: 'sep1', 'data-notify-appearance-sep': '' }),
-          // 自定义：泡泡背景/边框
+          // 自定义：泡泡背景（已抛弃边框）
           React.createElement('div', { key: 'bt', 'data-notify-appearance-title': '' }, '泡泡'),
           renderSlot('背景', 'bubbleBg'),
-          renderSlot('边框', 'bubbleBorder'),
           React.createElement('div', { key: 'bbo', 'data-notify-appearance-row': '' }, [
             React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '背景透明度'),
             React.createElement('input', {
@@ -1212,14 +1362,15 @@ window.__ModuleLoader__.load({
               onChange: (e) => setNum('bubbleBgOpacity', e.target.value),
             }),
           ]),
-          React.createElement('div', { key: 'bbr', 'data-notify-appearance-row': '' }, [
-            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '边框透明度'),
+          React.createElement('div', { key: 'bbb', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '背景模糊'),
             React.createElement('input', {
-              key: 'r', type: 'range', min: 0, max: 1, step: 0.05,
+              key: 'r', type: 'range', min: 0, max: 30, step: 1,
               'data-notify-appearance-range': '',
-              value: appearance.bubbleBorderOpacity,
-              onChange: (e) => setNum('bubbleBorderOpacity', e.target.value),
+              value: appearance.bubbleBgBlur,
+              onChange: (e) => setNum('bubbleBgBlur', e.target.value),
             }),
+            React.createElement('span', { key: 'v' }, appearance.bubbleBgBlur + 'px'),
           ]),
           React.createElement('div', { key: 'sep2', 'data-notify-appearance-sep': '' }),
           // 窗口背景/边框
@@ -1234,6 +1385,16 @@ window.__ModuleLoader__.load({
               value: appearance.windowBgOpacity,
               onChange: (e) => setNum('windowBgOpacity', e.target.value),
             }),
+          ]),
+          React.createElement('div', { key: 'wbb', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '背景模糊'),
+            React.createElement('input', {
+              key: 'r', type: 'range', min: 0, max: 30, step: 1,
+              'data-notify-appearance-range': '',
+              value: appearance.windowBgBlur,
+              onChange: (e) => setNum('windowBgBlur', e.target.value),
+            }),
+            React.createElement('span', { key: 'v' }, appearance.windowBgBlur + 'px'),
           ]),
           React.createElement('div', { key: 'wbr', 'data-notify-appearance-row': '' }, [
             React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '边框透明度'),
@@ -1281,15 +1442,37 @@ window.__ModuleLoader__.load({
               title: '取色器',
             }),
           ]),
-          React.createElement('div', { key: 'pad', 'data-notify-appearance-row': '' }, [
-            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '文字页边距'),
+          React.createElement('div', { key: 'padV', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '上下页边距'),
             React.createElement('input', {
               key: 'r', type: 'range', min: 0, max: 30, step: 1,
               'data-notify-appearance-range': '',
-              value: appearance.padding,
-              onChange: (e) => setNum('padding', e.target.value),
+              value: appearance.paddingV,
+              onChange: (e) => setNum('paddingV', e.target.value),
             }),
-            React.createElement('span', { key: 'v' }, appearance.padding + 'px'),
+            React.createElement('span', { key: 'v' }, appearance.paddingV + 'px'),
+          ]),
+          React.createElement('div', { key: 'padH', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '左右页边距'),
+            React.createElement('input', {
+              key: 'r', type: 'range', min: 0, max: 30, step: 1,
+              'data-notify-appearance-range': '',
+              value: appearance.paddingH,
+              onChange: (e) => setNum('paddingH', e.target.value),
+            }),
+            React.createElement('span', { key: 'v' }, appearance.paddingH + 'px'),
+          ]),
+          // 省略内容：开启后文字超过 6 行截断为 "..."（防泡泡过大）
+          React.createElement('div', { key: 'trunc', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '省略内容'),
+            React.createElement('label', { key: 's' }, [
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: !!appearance.truncate,
+                onChange: (e) => setNum('truncate', e.target.checked ? 1 : 0),
+              }),
+              ' 超出 6 行用“...”截断',
+            ]),
           ]),
           // 实时预览（窗口与历史素材之间）
           renderPreview(),
@@ -1297,9 +1480,143 @@ window.__ModuleLoader__.load({
           // 历史素材（按分类缩略图，点击应用 / ✕ 删除）
           React.createElement('div', { key: 'ht', 'data-notify-appearance-title': '' }, '历史素材'),
           renderHistoryRow('bubbleBg'),
-          renderHistoryRow('bubbleBorder'),
           renderHistoryRow('windowBg'),
           renderHistoryRow('windowBorder'),
+          // 自定义预设（存磁盘、可改名）
+          React.createElement('div', { key: 'sep5', 'data-notify-appearance-sep': '' }),
+          React.createElement('div', { key: 'cp', 'data-notify-appearance-title': '' }, '预设管理（泡泡外观全套）'),
+          React.createElement('div', { key: 'cp-save', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '保存当前为预设'),
+            React.createElement('input', {
+              key: 'i',
+              'data-notify-appearance-input': '',
+              value: presetNameDraft,
+              placeholder: '输入预设名字',
+              onChange: (e) => setPresetNameDraft(e.target.value),
+            }),
+            React.createElement('button', {
+              key: 'b',
+              'data-notify-appearance-btn': '',
+              onClick: saveCurrentAsPreset,
+            }, '保存'),
+          ]),
+          ...(customPresets.length === 0
+            ? [React.createElement('div', { key: 'cp-empty', 'data-notify-appearance-row': '' }, [
+                React.createElement('span', { key: 'e', 'data-notify-history-empty': '' }, '（还没有自定义预设）'),
+              ])]
+            : presetsExpanded
+              ? [
+                  ...customPresets.map((p) =>
+                    renaming === p.name
+                      ? React.createElement('div', { key: 'cp-' + p.name, 'data-notify-appearance-row': '' }, [
+                          React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, p.name),
+                          React.createElement('input', {
+                            key: 'i',
+                            'data-notify-appearance-input': '',
+                            value: renameDraft,
+                            placeholder: '新名字',
+                            onChange: (e) => setRenameDraft(e.target.value),
+                          }),
+                          React.createElement('button', {
+                            key: 'ok',
+                            'data-notify-appearance-btn': '',
+                            onClick: () => renamePreset(p.name),
+                          }, '确定'),
+                          React.createElement('button', {
+                            key: 'c',
+                            'data-notify-appearance-btn': '',
+                            onClick: () => setRenaming(null),
+                          }, '取消'),
+                        ])
+                      : React.createElement('div', { key: 'cp-' + p.name, 'data-notify-appearance-row': '' }, [
+                          React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, p.name),
+                          React.createElement('button', {
+                            key: 'a',
+                            'data-notify-appearance-btn': '',
+                            'data-active': appearance.preset === 'custom' && appearance.bubbleBg.path === (p.bubbleBg && p.bubbleBg.path) ? 'true' : 'false',
+                            onClick: () => applyCustomPreset(p),
+                          }, '应用'),
+                          React.createElement('button', {
+                            key: 'r',
+                            'data-notify-appearance-btn': '',
+                            onClick: () => { setRenaming(p.name); setRenameDraft(p.name) },
+                          }, '改名'),
+                          React.createElement('button', {
+                            key: 'd',
+                            'data-notify-appearance-btn': '',
+                            onClick: () => deletePreset(p.name),
+                          }, '删除'),
+                        ]),
+                  ),
+                  React.createElement('div', { key: 'cp-collapse', 'data-notify-appearance-row': '' }, [
+                    React.createElement('button', {
+                      key: 'b',
+                      'data-notify-appearance-btn': '',
+                      onClick: () => setPresetsExpanded(false),
+                    }, '收起 ▲'),
+                  ]),
+                ]
+              : [React.createElement('div', { key: 'cp-fold', 'data-notify-appearance-row': '' }, [
+                  React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '已存预设'),
+                  React.createElement('button', {
+                    key: 'b',
+                    'data-notify-appearance-btn': '',
+                    onClick: () => setPresetsExpanded(true),
+                  }, '▸ 展开（' + customPresets.length + ' 个预设）'),
+                ])]),
+          // 随机泡泡装扮（从用户导入的自定义预设里随机，每新泡泡随机一套完整外观）
+          React.createElement('div', { key: 'sep6', 'data-notify-appearance-sep': '' }),
+          React.createElement('div', { key: 'rp', 'data-notify-appearance-title': '' }, '随机泡泡装扮'),
+          React.createElement('div', { key: 'rp-sel', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '随机来源'),
+            poolExpanded
+              ? React.createElement('span', { key: 't', 'data-notify-history-thumbs': '' }, [
+                  ...(customPresets.length === 0
+                    ? [React.createElement('span', { key: 'e', 'data-notify-history-empty': '' }, '（先在「预设管理」保存预设）')]
+                    : customPresets.map((p) => React.createElement('label', { key: p.name, 'data-notify-history-item': '' }, [
+                        React.createElement('input', {
+                          type: 'checkbox',
+                          checked: poolSelected.includes(p.name),
+                          onChange: () => togglePoolOutfit(p.name),
+                        }),
+                        React.createElement('span', { key: 'n' }, p.name),
+                      ]))),
+                  React.createElement('button', {
+                    key: 'fold',
+                    'data-notify-history-fold-btn': '',
+                    onClick: () => setPoolExpanded(false),
+                  }, '收起 ▲'),
+                ])
+              : React.createElement('span', { key: 't', 'data-notify-history-thumbs': '' }, [
+                  React.createElement('span', { key: 'n', 'data-notify-history-empty': '' }, '已选 ' + poolSelected.length + '/' + customPresets.length + ' 个预设'),
+                  React.createElement('button', {
+                    key: 'expand',
+                    'data-notify-history-fold-btn': '',
+                    onClick: () => setPoolExpanded(true),
+                  }, '▸ 展开选择'),
+                ]),
+          ]),
+          React.createElement('div', { key: 'rp-enable', 'data-notify-appearance-row': '' }, [
+            React.createElement('span', { key: 'l', 'data-notify-appearance-label': '' }, '启用随机'),
+            React.createElement('label', { key: 's' }, [
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: poolEnabled,
+                onChange: (e) => setPoolEnabled(e.target.checked),
+              }),
+              ' 每次新泡泡随机一套预设装扮',
+            ]),
+            React.createElement('button', {
+              key: 'b',
+              'data-notify-appearance-btn': '',
+              onClick: saveRandomPool,
+            }, '保存设置'),
+          ]),
+          poolScanMsg
+            ? React.createElement('div', { key: 'rp-msg', 'data-notify-appearance-row': '' }, [
+                React.createElement('span', { key: 'm', 'data-notify-history-empty': '' }, poolScanMsg),
+              ])
+            : null,
           importError
             ? React.createElement('div', { key: 'importerr', 'data-notify-import-error': '' }, importError)
             : null,
