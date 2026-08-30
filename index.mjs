@@ -48,6 +48,9 @@ const ASSETS_DIR = path.join(DSH_HOME, 'profiles', 'web', 'node_modules', 'dsh-n
 const DATA_DIR = path.join(DSH_HOME, 'profiles', 'web', '.dsh-notify-data')
 const IMAGES_DIR = path.join(DATA_DIR, 'images')
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json')
+// 自定义预设（泡泡外观全套，可改名）与随机装扮池（磁盘持久化）
+const PRESETS_FILE = path.join(DATA_DIR, 'presets.json')
+const RANDOM_POOL_FILE = path.join(DATA_DIR, 'random-pool.json')
 // 允许读取的图片扩展名
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'])
 
@@ -149,6 +152,35 @@ export function apply(ctx, config = {}) {
     await writeHistory(history)
     return name
   }
+
+  /* ---------------- 预设 / 随机装扮 存储辅助 ---------------- */
+
+  async function readJsonFile(file, fallback) {
+    try {
+      const raw = await readFile(file, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (parsed !== null && typeof parsed === 'object') return parsed
+    } catch { /* 回退默认 */ }
+    return fallback
+  }
+  async function writeJsonFile(file, data) {
+    await mkdir(DATA_DIR, { recursive: true })
+    await writeFile(file, JSON.stringify(data, null, 2) + '\n', 'utf8')
+  }
+  const readPresets = () => readJsonFile(PRESETS_FILE, [])
+  const writePresets = (presets) => writeJsonFile(PRESETS_FILE, presets)
+  // 随机池（新版）：{ enabled, presetNames: [] }，presetNames 为空 = 使用全部自定义预设
+  // 兼容旧版文件夹池（folder/mode/outfits）→ 迁移为空预设选择
+  const readRandomPool = async () => {
+    const pool = await readJsonFile(RANDOM_POOL_FILE, { enabled: false, presetNames: [] })
+    if (pool.folder !== undefined || pool.mode !== undefined || pool.outfits !== undefined) {
+      const migrated = { enabled: !!pool.enabled, presetNames: [] }
+      await writeJsonFile(RANDOM_POOL_FILE, migrated)
+      return migrated
+    }
+    return { enabled: !!pool.enabled, presetNames: Array.isArray(pool.presetNames) ? pool.presetNames : [] }
+  }
+  const writeRandomPool = (pool) => writeJsonFile(RANDOM_POOL_FILE, pool)
 
   /* ---------------- HTTP 路由（client 半调用） ---------------- */
 
@@ -316,6 +348,84 @@ export function apply(ctx, config = {}) {
         // 删除文件（忽略错误）
         try { await rm(path.join(IMAGES_DIR, name), { force: true }) } catch { /* 忽略 */ }
         sendJson(res, 200, { ok: true })
+      },
+    }),
+    // 自定义预设（泡泡外观全套，存磁盘、可改名）：列表 / 保存 / 改名 / 删除
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/presets',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        sendJson(res, 200, { ok: true, presets: await readPresets() })
+      },
+    }),
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/presets/save',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const name = String(body.name || '').trim()
+        const preset = body.preset && typeof body.preset === 'object' ? body.preset : null
+        if (!name || !preset) { sendJson(res, 400, { ok: false, error: 'name and preset required' }); return }
+        const presets = await readPresets()
+        const idx = presets.findIndex((p) => p.name === name)
+        const entry = { name, ...preset, ts: Date.now() }
+        if (idx >= 0) presets[idx] = entry; else presets.push(entry)
+        await writePresets(presets)
+        sendJson(res, 200, { ok: true })
+      },
+    }),
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/presets/rename',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const oldName = String(body.oldName || '')
+        const newName = String(body.newName || '').trim()
+        if (!oldName || !newName) { sendJson(res, 400, { ok: false, error: 'oldName and newName required' }); return }
+        const presets = await readPresets()
+        const idx = presets.findIndex((p) => p.name === oldName)
+        if (idx < 0) { sendJson(res, 404, { ok: false, error: 'preset not found' }); return }
+        presets[idx].name = newName
+        await writePresets(presets)
+        sendJson(res, 200, { ok: true })
+      },
+    }),
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/presets/delete',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const name = String(body.name || '')
+        const presets = await readPresets()
+        await writePresets(presets.filter((p) => p.name !== name))
+        sendJson(res, 200, { ok: true })
+      },
+    }),
+    // 随机装扮池：读取 / 保存（从用户导入的自定义预设里随机）
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/random-pool',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        sendJson(res, 200, { ok: true, pool: await readRandomPool() })
+      },
+    }),
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/random-pool/save',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const pool = {
+          enabled: !!(body.pool && body.pool.enabled),
+          presetNames: Array.isArray(body.pool && body.pool.presetNames) ? body.pool.presetNames.map(String) : [],
+        }
+        await writeRandomPool(pool)
+        sendJson(res, 200, { ok: true, pool })
       },
     }),
     // 重启桌面软件窗口：先立刻关闭 DeepSeek-Harness-Web 窗口，等服务器重启
