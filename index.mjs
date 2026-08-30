@@ -9,10 +9,24 @@
  *
  * 生命周期与进程一致：装上即永久生效，重启不消失，无需审批。
  */
+import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
 export const name = 'dsh-notify'
 export const inject = ['webServer']
 
-const MAX_BODY_BYTES = 64 * 1024
+const MAX_BODY_BYTES = 4 * 1024 * 1024 // 4MB：允许大图
+// 插件 assets 目录：从 DSH_HOME 推导（import.meta.url 在源码模式下会解析错误）
+const DSH_HOME = process.env.DSH_HOME || path.join(process.env.USERPROFILE || '.', '.dsh')
+const ASSETS_DIR = path.join(DSH_HOME, 'profiles', 'web', 'node_modules', 'dsh-notify', 'assets')
+// 用户数据目录（持久化素材，重启不丢，插件更新不受影响）
+const DATA_DIR = path.join(DSH_HOME, 'profiles', 'web', '.dsh-notify-data')
+const IMAGES_DIR = path.join(DATA_DIR, 'images')
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json')
+// 允许读取的图片扩展名
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'])
 
 export function apply(ctx, config = {}) {
   const queue = []
@@ -73,6 +87,46 @@ export function apply(ctx, config = {}) {
     ts: Date.now(),
   })
 
+  /* ---------------- 素材持久化辅助 ---------------- */
+
+  async function readHistory() {
+    try {
+      const raw = await readFile(HISTORY_FILE, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch { /* 回退默认 */ }
+    return { bubbleBg: [], bubbleBorder: [], windowBg: [], windowBorder: [] }
+  }
+  async function writeHistory(history) {
+    await mkdir(DATA_DIR, { recursive: true })
+    await writeFile(HISTORY_FILE, JSON.stringify(history, null, 2) + '\n', 'utf8')
+  }
+  // 保存一张导入的图片：dataURL/base64 → 磁盘文件；返回文件名
+  // 相同内容的图（按内容哈希）在同一分类里只保留一份，重复导入直接复用
+  async function saveImportedImage(dataUrl, category) {
+    // 支持 data:image/png;base64,xxx 或纯 base64
+    const m = /^data:image\/([a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl)
+    const b64 = m ? m[2] : dataUrl
+    const ext = m ? (m[1] === 'jpeg' ? 'jpg' : m[1]) : 'png'
+    if (!IMAGE_EXT.has('.' + ext)) throw new Error('不支持的图片格式')
+    const buffer = Buffer.from(b64, 'base64')
+    const hash = createHash('sha256').update(buffer).digest('hex').slice(0, 16)
+    // 去重：同分类里已有相同内容的图 → 直接复用，不重复保存
+    const history = await readHistory()
+    const list = history[category] || []
+    for (const item of list) {
+      if (item.hash === hash) return item.name
+    }
+    const name = Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext
+    await mkdir(IMAGES_DIR, { recursive: true })
+    await writeFile(path.join(IMAGES_DIR, name), buffer)
+    // 记录历史
+    history[category] = list
+    history[category].push({ name, ts: Date.now(), hash })
+    await writeHistory(history)
+    return name
+  }
+
   /* ---------------- HTTP 路由（client 半调用） ---------------- */
 
   const disposers = [
@@ -108,6 +162,220 @@ export function apply(ctx, config = {}) {
         const enabled = !!body.enabled
         if (sessionId) aiSummaryBySession.set(sessionId, enabled)
         sendJson(res, 200, { ok: true, enabled })
+      },
+    }),
+    // 预设素材：/__notify/asset?name=<文件名> — 只读插件 assets 目录
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/asset',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        const url = new URL(req.url || '/', 'http://' + (req.headers.host || 'localhost'))
+        const name = String(url.searchParams.get('name') || '')
+        if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) {
+          sendJson(res, 400, { ok: false, error: 'invalid asset name' })
+          return
+        }
+        const ext = path.extname(name).toLowerCase()
+        if (!IMAGE_EXT.has(ext)) { sendJson(res, 400, { ok: false, error: 'not an image' }); return }
+        try {
+          const data = await readFile(path.join(ASSETS_DIR, name))
+          res.writeHead(200, {
+            'content-type': ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/bmp',
+            'cache-control': 'public, max-age=86400',
+            'content-length': data.length,
+          })
+          res.end(data)
+        } catch {
+          sendJson(res, 404, { ok: false, error: 'asset not found' })
+        }
+      },
+    }),
+    // 自定义本地图片：/__notify/file?path=<本地路径> — 带安全校验
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/file',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        const url = new URL(req.url || '/', 'http://' + (req.headers.host || 'localhost'))
+        const filePath = String(url.searchParams.get('path') || '')
+        if (!filePath) { sendJson(res, 400, { ok: false, error: 'path required' }); return }
+        const ext = path.extname(filePath).toLowerCase()
+        if (!IMAGE_EXT.has(ext)) { sendJson(res, 400, { ok: false, error: 'not an image' }); return }
+        try {
+          const data = await readFile(filePath)
+          res.writeHead(200, {
+            'content-type': ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/bmp',
+            'cache-control': 'no-store',
+            'content-length': data.length,
+          })
+          res.end(data)
+        } catch {
+          sendJson(res, 404, { ok: false, error: 'file not found' })
+        }
+      },
+    }),
+    // 读取用户导入的素材：/__notify/user-image?name=<文件>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/user-image',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        const url = new URL(req.url || '/', 'http://' + (req.headers.host || 'localhost'))
+        const name = String(url.searchParams.get('name') || '')
+        if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) {
+          sendJson(res, 400, { ok: false, error: 'invalid name' })
+          return
+        }
+        const ext = path.extname(name).toLowerCase()
+        if (!IMAGE_EXT.has(ext)) { sendJson(res, 400, { ok: false, error: 'not an image' }); return }
+        try {
+          const data = await readFile(path.join(IMAGES_DIR, name))
+          res.writeHead(200, {
+            'content-type': ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/bmp',
+            'cache-control': 'public, max-age=86400',
+            'content-length': data.length,
+          })
+          res.end(data)
+        } catch {
+          sendJson(res, 404, { ok: false, error: 'image not found' })
+        }
+      },
+    }),
+    // 导入并保存素材：POST { dataUrl, category }
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/import-image',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const dataUrl = String(body.dataUrl || '')
+        const category = String(body.category || '')
+        if (!dataUrl || !['bubbleBg', 'bubbleBorder', 'windowBg', 'windowBorder'].includes(category)) {
+          sendJson(res, 400, { ok: false, error: 'dataUrl and valid category required' })
+          return
+        }
+        try {
+          const name = await saveImportedImage(dataUrl, category)
+          sendJson(res, 200, { ok: true, name, url: '/__notify/user-image?name=' + encodeURIComponent(name) })
+        } catch (e) {
+          sendJson(res, 400, { ok: false, error: String((e && e.message) || e) })
+        }
+      },
+    }),
+    // 历史列表：GET /__notify/history
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/history',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405).end(); return }
+        const history = await readHistory()
+        sendJson(res, 200, { ok: true, history })
+      },
+    }),
+    // 删除历史素材：POST { name, category }
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/history/delete',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        const body = await readJson(req)
+        const name = String(body.name || '')
+        const category = String(body.category || '')
+        if (!name || !['bubbleBg', 'bubbleBorder', 'windowBg', 'windowBorder'].includes(category)) {
+          sendJson(res, 400, { ok: false, error: 'name and valid category required' })
+          return
+        }
+        const history = await readHistory()
+        const list = history[category] || []
+        history[category] = list.filter((item) => item.name !== name)
+        await writeHistory(history)
+        // 删除文件（忽略错误）
+        try { await rm(path.join(IMAGES_DIR, name), { force: true }) } catch { /* 忽略 */ }
+        sendJson(res, 200, { ok: true })
+      },
+    }),
+    // 重启桌面软件窗口：先立刻关闭 DeepSeek-Harness-Web 窗口，等服务器重启
+    // 完成（端口重新起来）后重开窗口。与 /dsh-market/restart（只重启服务器）配合：
+    // 客户端先调服务器重启，再调本接口 = 「后台重启 + 软件关闭重开」。
+    // 每一步都写日志到 %TEMP%\dsh-notify-restart-<时间戳>.log 便于排查。
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/__notify/restart-app',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405).end(); return }
+        // 端口：从请求 Host 推导，缺省 3080
+        let port = 3080
+        try {
+          const host = req.headers.host
+          if (host) {
+            const m = /:(\d{1,5})$/.exec(host)
+            if (m) {
+              const n = Number(m[1])
+              if (n > 0 && n < 65536) port = n
+            }
+          }
+        } catch { /* 保持缺省 */ }
+        const helper = [
+          "const { spawn } = require('node:child_process')",
+          "const fs = require('node:fs')",
+          "const os = require('node:os')",
+          "const path = require('node:path')",
+          "const net = require('node:net')",
+          `const port = ${port}`,
+          "const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)",
+          "const logFile = path.join(os.tmpdir(), 'dsh-notify-restart-' + stamp + '.log')",
+          "const note = (line) => { try { fs.appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\\n') } catch {} }",
+          'const sleep = (ms) => new Promise((r) => setTimeout(r, ms))',
+          'const listening = () => new Promise((resolve) => {',
+          '  const probe = net.connect({ host: "127.0.0.1", port })',
+          '  const done = (v) => { probe.destroy(); resolve(v) }',
+          '  probe.on("connect", () => done(true))',
+          '  probe.on("error", () => done(false))',
+          '  setTimeout(() => done(false), 500)',
+          '})',
+          "const runPs = (script) => new Promise((resolve) => {",
+          "  try {",
+          "    const ps = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', script], { stdio: ['ignore', 'pipe', 'pipe'] })",
+          "    let out = ''",
+          "    ps.stdout.on('data', (c) => { out += c })",
+          "    ps.on('close', () => resolve(out.trim()))",
+          "    ps.on('error', () => resolve(''))",
+          "  } catch { resolve('') }",
+          "})",
+          'const main = async () => {',
+          "  note('helper started, port=' + port)",
+          // 1) 立刻关窗口：拿到 exe 路径并杀掉所有 DeepSeek-Harness-Web 进程
+          '  const exe = await runPs([',
+          "    '$p = Get-Process DeepSeek-Harness-Web -ErrorAction SilentlyContinue | Select-Object -First 1',",
+          "    'if ($p -and $p.Path) {',",
+          "    '  $exe = $p.Path',",
+          "    '  Get-Process DeepSeek-Harness-Web -ErrorAction SilentlyContinue | Stop-Process -Force',",
+          "    '  $exe',",
+          "    '}',",
+          '  ].join("; "))',
+          "  note('window closed, exe=' + exe)",
+          // 2) 等旧服务器退出（/dsh-market/restart 已安排杀进程），最多 30s
+          '  const freeUntil = Date.now() + 30000',
+          '  while (Date.now() < freeUntil && await listening()) await sleep(250)',
+          "  note('port free: ' + !(await listening()))",
+          // 3) 等新服务器起来，最多 30s
+          '  const upUntil = Date.now() + 30000',
+          '  while (Date.now() < upUntil && !(await listening())) await sleep(500)',
+          "  note('port up: ' + await listening())",
+          // 4) 重开窗口（新窗口连上新服务器；找不到 exe 就跳过）
+          '  if (exe) {',
+          "    try { const c = spawn(exe, [], { detached: true, stdio: 'ignore' }); c.unref(); note('window relaunched: ' + exe) } catch (e) { note('relaunch failed: ' + (e && e.message)) }",
+          "  } else {",
+          "    note('no exe found; window restart skipped')",
+          '  }',
+          '}',
+          'main()',
+        ].join('\n')
+        try {
+          spawn(process.execPath, ['-e', helper], { detached: true, stdio: 'ignore' }).unref()
+        } catch { /* 忽略 */ }
+        sendJson(res, 202, { ok: true, note: 'restarting desktop window' })
       },
     }),
   ]
