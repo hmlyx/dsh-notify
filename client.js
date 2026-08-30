@@ -61,6 +61,28 @@ window.__ModuleLoader__.load({
   gap: 8px;
   padding: 8px;
 }
+/* 滚动条：鼠标在面板内才显示，移出面板即隐藏（滚动不受影响） */
+[data-notify-bubble-panel]:not(:hover) [data-notify-bubble-list]::-webkit-scrollbar,
+[data-notify-bubble-panel]:not(:hover) [data-notify-appearance]::-webkit-scrollbar {
+  width: 0;
+}
+[data-notify-bubble-panel]:hover [data-notify-bubble-list]::-webkit-scrollbar,
+[data-notify-bubble-panel]:hover [data-notify-appearance]::-webkit-scrollbar {
+  width: 8px;
+}
+[data-notify-bubble-list]::-webkit-scrollbar-track,
+[data-notify-appearance]::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-notify-bubble-list]::-webkit-scrollbar-thumb,
+[data-notify-appearance]::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.38);
+  border-radius: 4px;
+}
+[data-notify-bubble-list]::-webkit-scrollbar-thumb:hover,
+[data-notify-appearance]::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.55);
+}
 [data-notify-bubble-item] {
   position: relative;
   flex: none;
@@ -474,6 +496,7 @@ window.__ModuleLoader__.load({
         const [userSize, setUserSize] = React.useState(null)
         const dragRef = React.useRef(null)
         const listRef = React.useRef(null)
+        const panelRef = React.useRef(null)
 
         React.useEffect(() => {
           const unsubscribe = subscribe(() => {
@@ -499,7 +522,8 @@ window.__ModuleLoader__.load({
             const card = document.querySelector('[data-composer-card]')
             const vw = window.innerWidth
             const vh = window.innerHeight
-            const bottom = 8
+            // 面板底边离视口底部的目标距离
+            const targetBottom = 8
             let left = 0
             let autoWidth = 300
             if (card) {
@@ -513,6 +537,26 @@ window.__ModuleLoader__.load({
               left = vw - 350
               autoWidth = 300
             }
+            // 面板是 position:fixed，但若祖先有 transform/filter/backdrop-filter/
+            // will-change/contain，会变成它的「包含块」，left/bottom 就相对该祖先而非视口。
+            // wallpaper-engine 给 composer 卡加了 backdrop-filter，会把面板顶到屏幕外——
+            // 这里向上找包含块祖先，把 left/bottom 补偿回视口坐标。
+            let cbLeft = 0
+            let cbBottom = vh
+            let node = panelRef.current ? panelRef.current.parentElement : null
+            while (node && node !== document.body) {
+              const cs = window.getComputedStyle(node)
+              if (cs.transform !== 'none' || cs.perspective !== 'none' || cs.filter !== 'none' || cs.backdropFilter !== 'none'
+                || /transform/.test(cs.willChange) || /(paint|layout|strict|content)/.test(cs.contain)) {
+                const r = node.getBoundingClientRect()
+                cbLeft = r.left
+                cbBottom = r.bottom
+                break
+              }
+              node = node.parentElement
+            }
+            left = left - cbLeft
+            const bottom = cbBottom - vh + targetBottom
             // 面板最高到「标题栏下方」：标题栏高约 76px（header y=0~76, z=9），顶部保留 82px
             const HEADER_RESERVE = 82
             const maxToTop = Math.max(120, vh - HEADER_RESERVE)
@@ -655,6 +699,7 @@ window.__ModuleLoader__.load({
           const hasFrame = !!(appearance.windowBg && appearance.windowBg.path) || !!(appearance.windowBorder && appearance.windowBorder.path)
           return React.createElement('div', {
             'data-notify-bubble-panel': '',
+            ref: panelRef,
             style,
           }, [
             React.createElement('div', { key: 'frame', 'data-notify-appearance-frame': '' }, [
@@ -667,6 +712,7 @@ window.__ModuleLoader__.load({
         return React.createElement('div', {
           'data-notify-bubble-panel': '',
           'data-expanded': expanded ? 'true' : 'false',
+          ref: panelRef,
           style,
         }, [
           windowBg,
