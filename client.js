@@ -14,21 +14,22 @@
  * ── UI 功能区域 ──
  * 1. 🔔 提醒入口按钮（conversation.input.right 槽位）
  *    → BubbleEntry 组件：显示未读徽标，点击打开面板
- * 2. 🔄 快速重启按钮（conversation.input.left 槽位）
- *    → RestartButton 组件：调 /dsh-market/restart（重启服务器）+ /__notify/restart-app（重启桌面窗口）
- * 3. 提醒面板（conversation.input.overlay 槽位）→ BubblePanel 组件
+ * 2. 提醒面板（conversation.input.overlay 槽位）→ BubblePanel 组件
  *    用 ReactDOM.createPortal 渲染到 document.body（脱离 composer 子树，避免撑高滚动区）
  *    - 消息列表：data-notify-bubble-list，聊天式堆叠（最新在底部），双击展开，滚动条悬停显示
  *    - 底部按钮：提醒开关 / 重置大小 / AI总结 / 外观 / 收起
  *    - 仅「对话」标签显示：输入卡不可见时面板隐藏（composerVisible 检测，兼容其他插件标签）
- * 4. 外观面板 → AppearancePicker 组件（覆盖面板内容）：
- *    预设 / 泡泡背景边框(拉伸 fill/contain) / 窗口背景边框 / 透明度滑块 / 文字颜色+色号输入 /
- *    实时预览 / 历史素材（折叠+展开按钮+删除） / 完成
+ *    - 每条泡泡可带随机装扮（item.outfit：背景/透明度/模糊/文字色/页边距/省略全套）
+ * 3. 外观面板 → AppearancePicker 组件（覆盖面板内容）：
+ *    预设 / 泡泡背景(拉伸/透明度/模糊) / 窗口背景边框 / 文字颜色+色号+上下左右页边距+省略开关 /
+ *    实时预览 / 历史素材（折叠+展开按钮+删除） / 预设管理（存磁盘可改名） / 随机装扮（从预设随机）
+ *    （注：重启按钮已拆到独立插件 dsh-restart，见其 client.js 头部目录）
  * ── host 接口（见 index.mjs 头部同名目录）──
  *    POST /__notify/push · GET /__notify/poll · POST /__notify/set-ai-summary
  *    GET /__notify/asset · GET /__notify/file · GET /__notify/user-image
  *    POST /__notify/import-image · GET /__notify/history · POST /__notify/history/delete
- *    POST /__notify/restart-app
+ *    POST /__notify/presets · presets/save · presets/rename · presets/delete
+ *    GET /__notify/random-pool · POST /__notify/random-pool/save
  * ── 数据位置 ──
  *    用户素材：~/.dsh/profiles/web/.dsh-notify-data/{images/,history.json}
  *    外观设置：localStorage['dsh-notify-appearance']
@@ -267,21 +268,6 @@ window.__ModuleLoader__.load({
   border-top: 2px solid var(--dsw-alias-label-secondary, #888);
   border-top-right-radius: 3px;
 }
-[data-notify-restart-btn] {
-  border: 1px solid var(--dsw-alias-border-l2, #ccc);
-  background: transparent;
-  color: var(--dsw-alias-label-secondary, #555);
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-size: 12px;
-  white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-[data-notify-restart-btn]:hover { background: var(--dsw-alias-bg-layer-2, #eee); color: var(--dsw-alias-label-primary, #111); }
-[data-notify-restart-btn][data-busy='true'] { opacity: 0.6; cursor: wait; }
 /* 外观选择器 */
 [data-notify-appearance] {
   position: absolute;
@@ -903,39 +889,6 @@ window.__ModuleLoader__.load({
           badge > 0
             ? React.createElement('span', { key: 'b', 'data-notify-bubble-badge': '' }, badge > 99 ? '99+' : String(badge))
             : null,
-        ])
-      }
-
-      // ---------- 快速重启按钮（输入框左侧） ----------
-      // 点一次 = 服务器重启（/dsh-market/restart）+ 桌面窗口关闭重开（/__notify/restart-app）
-      function RestartButton(props) {
-        const [busy, setBusy] = React.useState(false)
-        const doRestart = () => {
-          if (busy) return
-          setBusy(true)
-          const markDone = () => setBusy(false)
-          fetch('/dsh-market/restart', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: '{}',
-          }).catch(() => {})
-          fetch('/__notify/restart-app', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: '{}',
-          }).then((res) => {
-            if (!(res.status === 202 || res.ok)) markDone()
-          }).catch(markDone)
-          // 服务器重启会杀掉当前页面，按钮状态交给新窗口
-        }
-        return React.createElement('button', {
-          'data-notify-restart-btn': '',
-          'data-busy': busy ? 'true' : 'false',
-          onClick: doRestart,
-          title: '重启 DeepSeek Harness（服务器 + 窗口关闭重开）',
-        }, [
-          React.createElement('span', { key: 'i' }, busy ? '⏳' : '🔄'),
-          React.createElement('span', { key: 't' }, busy ? '重启中…' : '重启'),
         ])
       }
 
@@ -1639,11 +1592,6 @@ window.__ModuleLoader__.load({
       ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register(
         { name: 'conversation.input.overlay', id: 'notify-bubble', order: 30, label: '提醒面板' },
         (props) => React.createElement(BubblePanel, { sessionId: props.sessionId }),
-      ))
-
-      ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
-        { name: 'conversation.input.left', id: 'notify-restart', order: 10, label: '快速重启' },
-        (props) => React.createElement(RestartButton, { sessionId: props.sessionId }),
       ))
 
       return () => {
