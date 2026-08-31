@@ -20,20 +20,23 @@
  *   GET  /__notify/file?path=                            自定义本地图片（读任意路径，校验扩展名）
  *   GET  /__notify/user-image?name=                      用户导入素材（.dsh-notify-data/images/）
  *   POST /__notify/import-image {dataUrl,category}       导入素材并持久化（sha256 去重）
- *   GET  /__notify/history                               历史素材列表 {bubbleBg,bubbleBorder,windowBg,windowBorder}
+ *   GET  /__notify/history                               历史素材列表 {bubbleBg,windowBg,windowBorder}
  *   POST /__notify/history/delete {name,category}        删除历史素材（连带删文件）
- *   POST /__notify/restart-app                           重启桌面窗口（detached helper：杀窗口→等端口→重开）
+ *   GET  /__notify/presets · POST /__notify/presets/save · presets/rename · presets/delete
+ *                                                        自定义预设（磁盘 presets.json，可改名）
+ *   GET  /__notify/random-pool · POST /__notify/random-pool/save
+ *                                                        随机装扮池（{enabled,presetNames}，从预设随机）
+ *   （注：重启窗口接口 /__notify/restart-app 已拆到独立插件 dsh-restart）
  * ── 注册的对外能力 ──
  *   工具 notify_push（任何预设/AI 可用，systemPrompt 有使用指引）
  *   systemPrompt 注入「AI 总结」指引（aiSummaryBySession 按会话开关）
  * ── 数据位置 ──
- *   DATA_DIR = ~/.dsh/profiles/web/.dsh-notify-data/（images/ 存素材，history.json 存历史）
+ *   DATA_DIR = ~/.dsh/profiles/web/.dsh-notify-data/（images/ 存素材，history.json/presets.json/random-pool.json）
  *   ASSETS_DIR = 插件包内 assets/（内置预设素材）
  * ── 常量/配置 ──
- *   MAX_BODY_BYTES=4MB（图片导入上限）、IMAGE_EXT 允许扩展名、category 四分类
+ *   MAX_BODY_BYTES=4MB（图片导入上限）、IMAGE_EXT 允许扩展名、category 三分类
  */
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
@@ -426,89 +429,6 @@ export function apply(ctx, config = {}) {
         }
         await writeRandomPool(pool)
         sendJson(res, 200, { ok: true, pool })
-      },
-    }),
-    // 重启桌面软件窗口：先立刻关闭 DeepSeek-Harness-Web 窗口，等服务器重启
-    // 完成（端口重新起来）后重开窗口。与 /dsh-market/restart（只重启服务器）配合：
-    // 客户端先调服务器重启，再调本接口 = 「后台重启 + 软件关闭重开」。
-    // 每一步都写日志到 %TEMP%\dsh-notify-restart-<时间戳>.log 便于排查。
-    ctx.webServer.register({
-      kind: 'exact',
-      path: '/__notify/restart-app',
-      handler: async (req, res) => {
-        if (req.method !== 'POST') { res.writeHead(405).end(); return }
-        // 端口：从请求 Host 推导，缺省 3080
-        let port = 3080
-        try {
-          const host = req.headers.host
-          if (host) {
-            const m = /:(\d{1,5})$/.exec(host)
-            if (m) {
-              const n = Number(m[1])
-              if (n > 0 && n < 65536) port = n
-            }
-          }
-        } catch { /* 保持缺省 */ }
-        const helper = [
-          "const { spawn } = require('node:child_process')",
-          "const fs = require('node:fs')",
-          "const os = require('node:os')",
-          "const path = require('node:path')",
-          "const net = require('node:net')",
-          `const port = ${port}`,
-          "const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)",
-          "const logFile = path.join(os.tmpdir(), 'dsh-notify-restart-' + stamp + '.log')",
-          "const note = (line) => { try { fs.appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\\n') } catch {} }",
-          'const sleep = (ms) => new Promise((r) => setTimeout(r, ms))',
-          'const listening = () => new Promise((resolve) => {',
-          '  const probe = net.connect({ host: "127.0.0.1", port })',
-          '  const done = (v) => { probe.destroy(); resolve(v) }',
-          '  probe.on("connect", () => done(true))',
-          '  probe.on("error", () => done(false))',
-          '  setTimeout(() => done(false), 500)',
-          '})',
-          "const runPs = (script) => new Promise((resolve) => {",
-          "  try {",
-          "    const ps = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', script], { stdio: ['ignore', 'pipe', 'pipe'] })",
-          "    let out = ''",
-          "    ps.stdout.on('data', (c) => { out += c })",
-          "    ps.on('close', () => resolve(out.trim()))",
-          "    ps.on('error', () => resolve(''))",
-          "  } catch { resolve('') }",
-          "})",
-          'const main = async () => {',
-          "  note('helper started, port=' + port)",
-          // 1) 立刻关窗口：拿到 exe 路径并杀掉所有 DeepSeek-Harness-Web 进程
-          '  const exe = await runPs([',
-          "    '$p = Get-Process DeepSeek-Harness-Web -ErrorAction SilentlyContinue | Select-Object -First 1',",
-          "    'if ($p -and $p.Path) {',",
-          "    '  $exe = $p.Path',",
-          "    '  Get-Process DeepSeek-Harness-Web -ErrorAction SilentlyContinue | Stop-Process -Force',",
-          "    '  $exe',",
-          "    '}',",
-          '  ].join("; "))',
-          "  note('window closed, exe=' + exe)",
-          // 2) 等旧服务器退出（/dsh-market/restart 已安排杀进程），最多 30s
-          '  const freeUntil = Date.now() + 30000',
-          '  while (Date.now() < freeUntil && await listening()) await sleep(250)',
-          "  note('port free: ' + !(await listening()))",
-          // 3) 等新服务器起来，最多 30s
-          '  const upUntil = Date.now() + 30000',
-          '  while (Date.now() < upUntil && !(await listening())) await sleep(500)',
-          "  note('port up: ' + await listening())",
-          // 4) 重开窗口（新窗口连上新服务器；找不到 exe 就跳过）
-          '  if (exe) {',
-          "    try { const c = spawn(exe, [], { detached: true, stdio: 'ignore' }); c.unref(); note('window relaunched: ' + exe) } catch (e) { note('relaunch failed: ' + (e && e.message)) }",
-          "  } else {",
-          "    note('no exe found; window restart skipped')",
-          '  }',
-          '}',
-          'main()',
-        ].join('\n')
-        try {
-          spawn(process.execPath, ['-e', helper], { detached: true, stdio: 'ignore' }).unref()
-        } catch { /* 忽略 */ }
-        sendJson(res, 202, { ok: true, note: 'restarting desktop window' })
       },
     }),
   ]
