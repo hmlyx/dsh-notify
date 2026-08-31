@@ -18,10 +18,9 @@
 | 拖拽 | 右下角调大小；右上角拉到屏幕顶端 |
 | 提醒：开/关 | 暂停 / 恢复接收提醒 |
 | AI总结：开/关 | AI 推送前先总结要点 |
-| 🎨 外观 | 自定义泡泡/窗口背景、边框、透明度、文字颜色、实时预览、历史素材 |
-| 🔄 重启 | 一键重启服务器 + 桌面窗口 |
+| 🎨 外观 | 自定义泡泡/窗口背景、透明度、模糊、文字颜色、页边距、实时预览、预设管理、随机装扮 |
 
-**安装**：仓库放入 `~\.dsh\profiles\web\node_modules\dsh-notify\`，在 `~\.dsh\profiles\web\package.json` 的 `dependencies` 加 `"dsh-notify": "1.0.0"`、`dsh.profile.bundles` 加 `"dsh-notify"`，然后点「🔄 重启」（新 bundle 需重启服务器进程）。
+**安装**：仓库放入 `~\.dsh\profiles\web\node_modules\dsh-notify\`，在 `~\.dsh\profiles\web\package.json` 的 `dependencies` 加 `"dsh-notify": "1.0.0"`、`dsh.profile.bundles` 加 `"dsh-notify"`，然后重启服务器进程（新 bundle 需重启生效）。
 
 ---
 
